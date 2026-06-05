@@ -19,6 +19,13 @@ EXCEPTION_MESSAGES = {
     4: "Slave device failure",
 }
 
+NO_RESPONSE_MARKERS = (
+    "no response received",
+    "no response",
+    "timeout",
+    "timed out",
+)
+
 
 @dataclass
 class ModbusResult:
@@ -131,7 +138,9 @@ class ModbusClient:
             else:
                 raise ValueError(f"Unsupported function code: {function_code}")
         except Exception as exc:
-            return ModbusResult(False, [], self._tx_hex(tx), self.last_rx_hex, "ERROR", str(exc), self._elapsed(started))
+            message = str(exc)
+            status = "NO RESPONSE" if self._is_no_response(message) else "ERROR"
+            return ModbusResult(False, [], self._tx_hex(tx), self.last_rx_hex, status, message, self._elapsed(started))
 
         elapsed = self._elapsed(started)
         if result is None:
@@ -167,7 +176,9 @@ class ModbusClient:
                 result = _call_with_slave(self.client.write_registers, address, values, slave_id=slave)
                 written_values = list(values)
         except Exception as exc:
-            return ModbusResult(False, [], self.last_tx_hex, self.last_rx_hex, "ERROR", str(exc), self._elapsed(started))
+            message = str(exc)
+            status = "NO RESPONSE" if self._is_no_response(message) else "ERROR"
+            return ModbusResult(False, [], self.last_tx_hex, self.last_rx_hex, status, message, self._elapsed(started))
 
         elapsed = self._elapsed(started)
         if result is None:
@@ -182,6 +193,10 @@ class ModbusClient:
 
     def _elapsed(self, started: float) -> float:
         return (time.monotonic() - started) * 1000
+
+    def _is_no_response(self, message: str) -> bool:
+        normalized = message.lower()
+        return any(marker in normalized for marker in NO_RESPONSE_MARKERS)
 
     def _rtu_or_tcp(self, slave: int, pdu: bytes) -> bytes:
         if self.mode == "TCP":

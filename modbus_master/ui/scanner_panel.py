@@ -21,6 +21,7 @@ FC_LABELS = {
 
 class ScannerWorker(QObject):
     row_ready = pyqtSignal(dict)
+    message_ready = pyqtSignal(str, str)
     progress = pyqtSignal(int)
     finished = pyqtSignal()
 
@@ -37,26 +38,47 @@ class ScannerWorker(QObject):
         start = int(self.params["start"])
         count = int(self.params["count"])
         fc = int(self.params["function_code"])
-        for offset in range(count):
+        slave_start = int(self.params["slave_start"])
+        slave_stop = int(self.params["slave_stop"])
+        if slave_stop < slave_start:
+            slave_start, slave_stop = slave_stop, slave_start
+
+        total = count * (slave_stop - slave_start + 1)
+        completed = 0
+        for slave_id in range(slave_start, slave_stop + 1):
+            for offset in range(count):
+                if self.cancelled:
+                    break
+                address = start + offset
+                result = self.client.read(fc, address, 1, slave_id=slave_id)
+                if result.ok:
+                    value = result.values[0] if result.values else ""
+                    self.row_ready.emit(
+                        {
+                            "slave_id": slave_id,
+                            "address": address,
+                            "function_code": fc,
+                            "value": value,
+                            "status": result.status,
+                            "ok": True,
+                            "no_response": False,
+                            "tx": result.tx_hex,
+                            "rx": result.rx_hex,
+                        }
+                    )
+                elif result.status == "NO RESPONSE":
+                    skipped = count - offset - 1
+                    completed += skipped + 1
+                    self.progress.emit(int((completed / total) * 100))
+                    self.message_ready.emit(
+                        f"Slave {slave_id} skipped after no response from address {address}",
+                        "Error",
+                    )
+                    break
+                completed += 1
+                self.progress.emit(int((completed / total) * 100))
             if self.cancelled:
                 break
-            address = start + offset
-            result = self.client.read(fc, address, 1)
-            if result.ok:
-                value = result.values[0] if result.values else ""
-                self.row_ready.emit(
-                    {
-                        "address": address,
-                        "function_code": fc,
-                        "value": value,
-                        "status": result.status,
-                        "ok": True,
-                        "no_response": False,
-                        "tx": result.tx_hex,
-                        "rx": result.rx_hex,
-                    }
-                )
-            self.progress.emit(int(((offset + 1) / count) * 100))
         self.finished.emit()
 
 
@@ -71,6 +93,12 @@ class ScannerPanel(QWidget):
         self.count_spin = QSpinBox()
         self.count_spin.setRange(1, 2000)
         self.count_spin.setValue(32)
+        self.slave_start_spin = QSpinBox()
+        self.slave_start_spin.setRange(1, 247)
+        self.slave_start_spin.setValue(1)
+        self.slave_stop_spin = QSpinBox()
+        self.slave_stop_spin.setRange(1, 247)
+        self.slave_stop_spin.setValue(1)
         self.fc_combo = QComboBox()
         self.fc_combo.addItems(list(FC_LABELS.keys()))
         self.fc_combo.setCurrentText("FC03 Holding Registers")
@@ -82,6 +110,8 @@ class ScannerPanel(QWidget):
         form = QFormLayout()
         form.addRow("Start Address", self.start_spin)
         form.addRow("Count", self.count_spin)
+        form.addRow("Start Slave ID", self.slave_start_spin)
+        form.addRow("Stop Slave ID", self.slave_stop_spin)
         form.addRow("Function Code", self.fc_combo)
 
         buttons = QHBoxLayout()
@@ -102,12 +132,17 @@ class ScannerPanel(QWidget):
         return {
             "start": self.start_spin.value(),
             "count": self.count_spin.value(),
+            "slave_start": self.slave_start_spin.value(),
+            "slave_stop": self.slave_stop_spin.value(),
             "function_code": FC_LABELS[self.fc_combo.currentText()],
         }
 
     def set_params(self, data: dict) -> None:
         self.start_spin.setValue(int(data.get("start", 0)))
         self.count_spin.setValue(int(data.get("count", 32)))
+        slave_start = int(data.get("slave_start", data.get("slave_id", 1)))
+        self.slave_start_spin.setValue(slave_start)
+        self.slave_stop_spin.setValue(int(data.get("slave_stop", slave_start)))
         fc = int(data.get("function_code", 3))
         for label, code in FC_LABELS.items():
             if code == fc:
