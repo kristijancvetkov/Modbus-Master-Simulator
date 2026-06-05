@@ -34,6 +34,7 @@ class MainWindow(QMainWindow):
         self.error_count = 0
         self.scanner_thread: QThread | None = None
         self.scanner_worker: ScannerWorker | None = None
+        self.polling = False
 
         self.connection_panel = ConnectionPanel()
         self.register_table = RegisterTable()
@@ -122,6 +123,7 @@ class MainWindow(QMainWindow):
         self.connection_panel.disconnect_requested.connect(self.disconnect_modbus)
         self.register_table.poll_interval_changed.connect(self.poll_timer.setInterval)
         self.register_table.write_requested.connect(self.write_register)
+        self.register_table.value_edit_requested.connect(self.write_register_value)
         self.scanner_panel.scan_requested.connect(self.start_scan)
         self.scanner_panel.cancel_requested.connect(self.cancel_scan)
 
@@ -146,31 +148,43 @@ class MainWindow(QMainWindow):
         self.log("Disconnected", "Info")
 
     def poll_registers(self) -> None:
+        if self.polling or self.scanner_thread is not None:
+            return
         if not self.client.connected or not self.register_table.auto_poll.isChecked():
             return
 
-        for row in range(self.register_table.table.rowCount()):
-            if not self.register_table.table.cellWidget(row, 1).isChecked():
-                continue
-            cfg = self.register_table.row_config(row)
-            data_type = cfg["data_type"]
-            count = required_registers(data_type, cfg["length"])
-            result = self.client.read(cfg["function_code"], cfg["address"], count)
-            self.log_modbus(result, f"Poll row {row + 1}")
-            if not result.ok:
-                self.record_error(result.error or result.status)
-                continue
+        self.polling = True
+        try:
+            for row in range(self.register_table.table.rowCount()):
+                if not self.register_table.table.cellWidget(row, 1).isChecked():
+                    continue
+                cfg = self.register_table.row_config(row)
+                data_type = cfg["data_type"]
+                count = required_registers(data_type, cfg["length"])
+                result = self.client.read(cfg["function_code"], cfg["address"], count, slave_id=cfg["slave_id"])
+                self.log_modbus(result, f"Poll row {row + 1}")
+                if not result.ok:
+                    self.record_error(result.error or result.status)
+                    if result.status == "NO RESPONSE":
+                        self.register_table.update_row_value(row, "NO RESPONSE", "", True)
+                        self.register_table.set_row_auto_poll(row, False)
+                        self.log(
+                            f"Auto-poll disabled for slave {cfg['slave_id']} address {cfg['address']} after no response",
+                            "Error",
+                        )
+                    continue
 
-            try:
-                value = decode_registers(result.values, data_type)
-                raw = " ".join("01" if bool(v) else "00" for v in result.values) if cfg["function_code"] in (1, 2) else registers_to_hex(result.values)
-                old = self.register_table.table.item(row, 7).text()
-                changed = old not in ("", str(value)) and str(value) != old
-                self.register_table.update_row_value(row, str(value), raw, changed)
-            except Exception as exc:
-                self.record_error(str(exc))
-
-        self.last_poll_status.setText(f"Last poll: {self.timestamp()}")
+                try:
+                    value = decode_registers(result.values, data_type)
+                    raw = " ".join("01" if bool(v) else "00" for v in result.values) if cfg["function_code"] in (1, 2) else registers_to_hex(result.values)
+                    old = self.register_table.table.item(row, 8).text()
+                    changed = old not in ("", str(value)) and str(value) != old
+                    self.register_table.update_row_value(row, str(value), raw, changed)
+                except Exception as exc:
+                    self.record_error(str(exc))
+        finally:
+            self.polling = False
+            self.last_poll_status.setText(f"Last poll: {self.timestamp()}")
 
     def write_register(self, row: int) -> None:
         if row < 0 or row >= self.register_table.table.rowCount():
@@ -187,9 +201,23 @@ class MainWindow(QMainWindow):
         value, ok = QInputDialog.getText(self, "Write value", f"New value for address {cfg['address']}:")
         if not ok:
             return
+        self.write_register_value(row, value)
+
+    def write_register_value(self, row: int, value: str) -> None:
+        if row < 0 or row >= self.register_table.table.rowCount():
+            return
+        if not self.client.connected:
+            QMessageBox.information(self, "Not connected", "Connect before writing a value.")
+            return
+
+        cfg = self.register_table.row_config(row)
+        if cfg["function_code"] in (2, 4):
+            QMessageBox.warning(self, "Read-only function", "FC02 discrete inputs and FC04 input registers are read-only.")
+            return
+
         try:
             registers, coil_value = encode_value(value, cfg["data_type"])
-            result = self.client.write(cfg["function_code"], cfg["address"], registers, coil_value)
+            result = self.client.write(cfg["function_code"], cfg["address"], registers, coil_value, slave_id=cfg["slave_id"])
         except Exception as exc:
             self.record_error(str(exc))
             QMessageBox.warning(self, "Write failed", str(exc))
@@ -209,19 +237,26 @@ class MainWindow(QMainWindow):
         if self.scanner_thread is not None:
             return
 
+        self.poll_timer.stop()
         self.scanner_panel.set_scanning(True)
         self.scanner_thread = QThread(self)
         self.scanner_worker = ScannerWorker(self.client, params)
         self.scanner_worker.moveToThread(self.scanner_thread)
         self.scanner_thread.started.connect(self.scanner_worker.run)
         self.scanner_worker.row_ready.connect(self.on_scan_row)
+        self.scanner_worker.message_ready.connect(self.log)
         self.scanner_worker.progress.connect(self.scanner_panel.progress.setValue)
         self.scanner_worker.finished.connect(self.scan_finished)
         self.scanner_worker.finished.connect(self.scanner_thread.quit)
         self.scanner_worker.finished.connect(self.scanner_worker.deleteLater)
         self.scanner_thread.finished.connect(self.scanner_thread.deleteLater)
         self.scanner_thread.start()
-        self.log(f"Register scan started: start={params['start']} count={params['count']} fc={params['function_code']}", "Info")
+        self.log(
+            "Register scan started: "
+            f"slave={params['slave_start']}-{params['slave_stop']} "
+            f"start={params['start']} count={params['count']} fc={params['function_code']}",
+            "Info",
+        )
 
     def cancel_scan(self) -> None:
         if self.scanner_worker:
@@ -237,6 +272,7 @@ class MainWindow(QMainWindow):
 
     def scan_finished(self) -> None:
         self.scanner_panel.set_scanning(False)
+        self.poll_timer.start(self.register_table.interval_spin.value())
         self.log("Register scan finished", "Info")
         self.scanner_thread = None
         self.scanner_worker = None
