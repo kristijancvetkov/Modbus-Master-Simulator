@@ -166,7 +166,7 @@ class MainWindow(QMainWindow):
                 raw = " ".join("01" if bool(v) else "00" for v in result.values) if cfg["function_code"] in (1, 2) else registers_to_hex(result.values)
                 old = self.register_table.table.item(row, 7).text()
                 changed = old not in ("", str(value)) and str(value) != old
-                self.register_table.update_row_value(row, str(value), raw, self.timestamp(), changed)
+                self.register_table.update_row_value(row, str(value), raw, changed)
             except Exception as exc:
                 self.record_error(str(exc))
 
@@ -228,7 +228,7 @@ class MainWindow(QMainWindow):
             self.scanner_worker.cancel()
 
     def on_scan_row(self, data: dict) -> None:
-        self.scanner_panel.add_result(data)
+        self.register_table.upsert_scanned_register(data)
         status = data.get("status", "")
         level = "Info" if data.get("ok") else "Error"
         self.log(f"[{self.timestamp()}] TX: {data.get('tx', '')} | RX: {data.get('rx', '')} | Status: {status}", level)

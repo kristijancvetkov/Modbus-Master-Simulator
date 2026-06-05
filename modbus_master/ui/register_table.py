@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QInputDialog,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -38,7 +39,6 @@ class RegisterTable(QWidget):
         "Data Type",
         "Value",
         "Raw Hex",
-        "Last Updated",
         "Write",
     ]
 
@@ -46,6 +46,7 @@ class RegisterTable(QWidget):
         super().__init__(parent)
         self.add_button = QPushButton("Add Row")
         self.remove_button = QPushButton("Remove")
+        self.remove_all_button = QPushButton("Remove All")
         self.auto_poll = QCheckBox("Auto Poll")
         self.auto_poll.setChecked(True)
         self.interval_spin = QSpinBox()
@@ -56,6 +57,7 @@ class RegisterTable(QWidget):
         toolbar = QHBoxLayout()
         toolbar.addWidget(self.add_button)
         toolbar.addWidget(self.remove_button)
+        toolbar.addWidget(self.remove_all_button)
         toolbar.addStretch(1)
         toolbar.addWidget(self.auto_poll)
         toolbar.addWidget(self.interval_spin)
@@ -65,19 +67,23 @@ class RegisterTable(QWidget):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.table.horizontalHeader().setStretchLastSection(False)
-        self.table.setColumnWidth(0, 42)
-        self.table.setColumnWidth(1, 52)
-        self.table.setColumnWidth(2, 90)
-        self.table.setColumnWidth(3, 170)
-        self.table.setColumnWidth(4, 110)
-        self.table.setColumnWidth(5, 70)
-        self.table.setColumnWidth(6, 100)
-        self.table.setColumnWidth(7, 130)
-        self.table.setColumnWidth(8, 130)
-        self.table.setColumnWidth(9, 150)
-        self.table.setColumnWidth(10, 80)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        self.table.setColumnWidth(0, 54)
+        self.table.setColumnWidth(1, 58)
+        self.table.setColumnWidth(2, 96)
+        self.table.setColumnWidth(3, 220)
+        self.table.setColumnWidth(4, 136)
+        self.table.setColumnWidth(5, 86)
+        self.table.setColumnWidth(6, 124)
+        self.table.setColumnWidth(7, 170)
+        self.table.setColumnWidth(8, 170)
+        self.table.setColumnWidth(9, 90)
+        for column in (0, 1, 2, 4, 5, 6, 9):
+            header.setSectionResizeMode(column, QHeaderView.Fixed)
+        for column in (3, 7, 8):
+            header.setSectionResizeMode(column, QHeaderView.Stretch)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(8, 8, 8, 8)
@@ -87,10 +93,11 @@ class RegisterTable(QWidget):
 
         self.add_button.clicked.connect(lambda: self.add_register())
         self.remove_button.clicked.connect(self.remove_selected)
+        self.remove_all_button.clicked.connect(self.remove_all)
         self.interval_spin.valueChanged.connect(self.poll_interval_changed.emit)
         self.table.customContextMenuRequested.connect(self.open_context_menu)
 
-    def add_register(self, data: dict | None = None) -> None:
+    def add_register(self, data: dict | None = None, sort_after: bool = True) -> int:
         data = data or {}
         row = self.table.rowCount()
         self.table.insertRow(row)
@@ -109,16 +116,19 @@ class RegisterTable(QWidget):
 
         fc = QComboBox()
         fc.addItems(FC_LABELS)
+        fc.setMinimumWidth(104)
         fc.setCurrentText(CODE_TO_FC.get(int(data.get("function_code", 3)), "FC03"))
         self.table.setCellWidget(row, 4, fc)
 
         length = QSpinBox()
         length.setRange(1, 125)
+        length.setMinimumWidth(72)
         length.setValue(int(data.get("length", 1)))
         self.table.setCellWidget(row, 5, length)
 
         dtype = QComboBox()
         dtype.addItems([item.value for item in DataType])
+        dtype.setMinimumWidth(96)
         dtype.setCurrentText(str(data.get("data_type", DataType.UINT16.value)))
         self.table.setCellWidget(row, 6, dtype)
 
@@ -128,15 +138,47 @@ class RegisterTable(QWidget):
         raw = QTableWidgetItem(str(data.get("raw_hex", "")))
         raw.setFlags(raw.flags() & ~Qt.ItemIsEditable)
         self.table.setItem(row, 8, raw)
-        updated = QTableWidgetItem(str(data.get("last_updated", "")))
-        updated.setFlags(updated.flags() & ~Qt.ItemIsEditable)
-        self.table.setItem(row, 9, updated)
 
         write = QPushButton("Write")
         write.clicked.connect(self._emit_write_for_sender)
-        self.table.setCellWidget(row, 10, write)
+        self.table.setCellWidget(row, 9, write)
 
         dtype.currentTextChanged.connect(lambda text, spin=length: spin.setValue(required_registers(text, spin.value())))
+        if sort_after:
+            self.sort_by_address()
+            return self.find_row(self._data_address(data, row), self._data_function_code(data))
+        return row
+
+    def upsert_scanned_register(self, data: dict) -> None:
+        function_code = int(data.get("function_code", 3))
+        address = int(data.get("address", 0))
+        value = str(data.get("value", ""))
+        raw_hex = self._scan_raw_value(function_code, value)
+        row = self.find_row(address, function_code)
+
+        if row is None:
+            row = self.add_register(
+                {
+                    "address": address,
+                    "alias": f"Scanned FC{function_code:02d} {address}",
+                    "function_code": function_code,
+                    "length": 1,
+                    "data_type": "BOOL" if function_code in (1, 2) else "UINT16",
+                    "value": value,
+                    "raw_hex": raw_hex,
+                }
+            )
+            self.flash_row(row)
+            return
+
+        old = self._item_text(row, 7)
+        self.update_row_value(row, value, raw_hex, old not in ("", value))
+
+    def find_row(self, address: int, function_code: int) -> int | None:
+        for row in range(self.table.rowCount()):
+            if self.row_config(row)["address"] == address and self.row_config(row)["function_code"] == function_code:
+                return row
+        return None
 
     def rows(self) -> list[dict]:
         rows = []
@@ -154,17 +196,13 @@ class RegisterTable(QWidget):
             "data_type": self.table.cellWidget(row, 6).currentText(),
             "value": self._item_text(row, 7),
             "raw_hex": self._item_text(row, 8),
-            "last_updated": self._item_text(row, 9),
         }
 
     def load_rows(self, rows: list[dict]) -> None:
         self.table.setRowCount(0)
-        if rows:
-            for row in rows:
-                self.add_register(row)
-        else:
-            self.add_register({"address": 0, "alias": "Register 0", "function_code": 3, "data_type": "UINT16"})
-        self.renumber()
+        for row in rows:
+            self.add_register(row, sort_after=False)
+        self.sort_by_address()
 
     def remove_selected(self) -> None:
         selected = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
@@ -172,12 +210,26 @@ class RegisterTable(QWidget):
             self.table.removeRow(row)
         self.renumber()
 
-    def update_row_value(self, row: int, value: str, raw_hex: str, timestamp: str, changed: bool) -> None:
+    def remove_all(self) -> None:
+        if self.table.rowCount() == 0:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove all registers",
+            "Remove all saved registers?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.table.setRowCount(0)
+        self.renumber()
+
+    def update_row_value(self, row: int, value: str, raw_hex: str, changed: bool) -> None:
         if row < 0 or row >= self.table.rowCount():
             return
         self.table.item(row, 7).setText(value)
         self.table.item(row, 8).setText(raw_hex)
-        self.table.item(row, 9).setText(timestamp)
         if changed:
             self.flash_row(row)
 
@@ -218,6 +270,13 @@ class RegisterTable(QWidget):
         for row in range(self.table.rowCount()):
             self.table.item(row, 0).setText(str(row + 1))
 
+    def sort_by_address(self) -> None:
+        rows = sorted(self.rows(), key=lambda row: (row["address"], row["function_code"], row["alias"]))
+        self.table.setRowCount(0)
+        for row in rows:
+            self.add_register(row, sort_after=False)
+        self.renumber()
+
     def _restore_row(self, row: int, color: QColor) -> None:
         if row >= self.table.rowCount():
             return
@@ -236,9 +295,31 @@ class RegisterTable(QWidget):
         except ValueError:
             return default
 
+    def _scan_raw_value(self, function_code: int, value: str) -> str:
+        try:
+            numeric = int(value)
+        except ValueError:
+            return ""
+        if function_code in (1, 2):
+            return "01" if bool(numeric) else "00"
+        return f"{numeric & 0xFFFF:04X}"
+
+    def _data_address(self, data: dict, default: int) -> int:
+        try:
+            value = data.get("address", default)
+            return int(value, 0) if isinstance(value, str) else int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _data_function_code(self, data: dict) -> int:
+        try:
+            return int(data.get("function_code", 3))
+        except (TypeError, ValueError):
+            return 3
+
     def _emit_write_for_sender(self) -> None:
         button = self.sender()
         for row in range(self.table.rowCount()):
-            if self.table.cellWidget(row, 10) is button:
+            if self.table.cellWidget(row, 9) is button:
                 self.write_requested.emit(row)
                 return
